@@ -6,7 +6,8 @@ import (
 	"compress/zlib"
 	"context"
 	"crypto/md5"
-	"encoding/json"
+	"encoding/gob"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"math/rand"
@@ -19,7 +20,10 @@ import (
 	"sync"
 	"time"
 
+	bolt "go.etcd.io/bbolt"
+
 	"pansou/model"
+	utiljson "pansou/util/json"
 	"pansou/util"
 )
 
@@ -29,6 +33,7 @@ const (
 	checkStateLocked      = "locked"
 	checkStateUnsupported = "unsupported"
 	checkStateUncertain   = "uncertain"
+	checkCacheBucketName  = "check_results"
 )
 
 type cachedCheckResult struct {
@@ -42,12 +47,18 @@ type activeCheckCall struct {
 	err    error
 }
 
+type cachedCheckDiskEntry struct {
+	Result    model.CheckResult
+	ExpiresAt int64
+}
+
 type CheckService struct {
 	mu        sync.Mutex
 	cache     map[string]cachedCheckResult
 	inflight  map[string]*activeCheckCall
 	client    *http.Client
 	cacheFile string
+	cacheDB   *bolt.DB
 }
 
 func NewCheckService() *CheckService {
@@ -55,9 +66,10 @@ func NewCheckService() *CheckService {
 		cache:     make(map[string]cachedCheckResult),
 		inflight:  make(map[string]*activeCheckCall),
 		client:    util.GetHTTPClient(),
-		cacheFile: filepath.Join(os.TempDir(), "pansou_check_cache.json"),
+		cacheFile: filepath.Join(".", "cache", "check_cache.db"),
 	}
-	service.loadCacheFromDisk()
+	service.openCacheStore()
+	service.pruneExpiredCacheStore()
 	return service
 }
 
@@ -108,17 +120,34 @@ func (s *CheckService) checkOne(item model.CheckItem) model.CheckResult {
 
 func (s *CheckService) getCached(key string) (model.CheckResult, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	entry, ok := s.cache[key]
+	if ok {
+		if time.Now().After(entry.expiresAt) {
+			delete(s.cache, key)
+			s.mu.Unlock()
+			s.deletePersistentCache(key)
+			return model.CheckResult{}, false
+		}
+
+		result := entry.result
+		s.mu.Unlock()
+		return result, true
+	}
+	s.mu.Unlock()
+
+	entry, ok = s.loadPersistentCache(key)
 	if !ok {
 		return model.CheckResult{}, false
 	}
 
 	if time.Now().After(entry.expiresAt) {
-		delete(s.cache, key)
+		s.deletePersistentCache(key)
 		return model.CheckResult{}, false
 	}
+
+	s.mu.Lock()
+	s.cache[key] = entry
+	s.mu.Unlock()
 
 	return entry.result, true
 }
@@ -139,22 +168,26 @@ func (s *CheckService) acquireInflight(key string) (*activeCheckCall, bool) {
 }
 
 func (s *CheckService) finishInflight(key string, call *activeCheckCall, result model.CheckResult, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	var entry cachedCheckResult
 	call.result = result
 	call.err = err
 
+	s.mu.Lock()
 	if err == nil {
-		s.cache[key] = cachedCheckResult{
+		entry = cachedCheckResult{
 			result:    result,
 			expiresAt: time.UnixMilli(result.ExpiresAt),
 		}
-		s.saveCacheToDiskLocked()
+		s.cache[key] = entry
 	}
 
 	delete(s.inflight, key)
 	close(call.done)
+	s.mu.Unlock()
+
+	if err == nil {
+		s.savePersistentCache(key, entry)
+	}
 }
 
 func (s *CheckService) runCheck(item model.CheckItem, normalized string) (model.CheckResult, error) {
@@ -209,7 +242,7 @@ func (s *CheckService) checkAliyun(item model.CheckItem, normalized string) (mod
 		Code       string `json:"code"`
 		Message    string `json:"message"`
 	}
-	_ = json.Unmarshal(body, &parsed)
+	_ = utiljson.Unmarshal(body, &parsed)
 
 	switch {
 	case statusCode == http.StatusOK && (parsed.ShareName != "" || parsed.ShareTitle != ""):
@@ -250,7 +283,7 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string) (mode
 			Stoken string `json:"stoken"`
 		} `json:"data"`
 	}
-	_ = json.Unmarshal(tokenBody, &tokenResp)
+	_ = utiljson.Unmarshal(tokenBody, &tokenResp)
 
 	switch tokenResp.Code {
 	case 0:
@@ -286,10 +319,10 @@ func (s *CheckService) checkQuark(item model.CheckItem, normalized string) (mode
 	var detailResp struct {
 		Code int `json:"code"`
 		Data struct {
-			List []json.RawMessage `json:"list"`
+			List []any `json:"list"`
 		} `json:"data"`
 	}
-	_ = json.Unmarshal(detailBody, &detailResp)
+	_ = utiljson.Unmarshal(detailBody, &detailResp)
 
 	if detailResp.Code == 0 && len(detailResp.Data.List) > 0 {
 		return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
@@ -355,7 +388,7 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string) (mode
 			Errmsg string `json:"errmsg"`
 			Randsk string `json:"randsk"`
 		}
-		_ = json.Unmarshal(body, &verifyResp)
+		_ = utiljson.Unmarshal(body, &verifyResp)
 
 		switch verifyResp.Errno {
 		case 0:
@@ -387,7 +420,7 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string) (mode
 		Errmsg string `json:"errmsg"`
 		List   []any  `json:"list"`
 	}
-	_ = json.Unmarshal(body, &listResp)
+	_ = utiljson.Unmarshal(body, &listResp)
 
 	switch listResp.Errno {
 	case 0:
@@ -430,7 +463,7 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string) (mod
 	query.Set("shareCode", shareCodeParam)
 	targetURL.RawQuery = query.Encode()
 
-	body, _, err := s.doRequest(ctx, "GET", targetURL.String(), nil, map[string]string{
+	body, statusCode, err := s.doRequest(ctx, "GET", targetURL.String(), nil, map[string]string{
 		"referer":   referer,
 		"sign-type": "1",
 	})
@@ -438,27 +471,57 @@ func (s *CheckService) checkTianyi(item model.CheckItem, normalized string) (mod
 		return s.buildResult(item, normalized, checkStateUncertain, false, "请求失败"), err
 	}
 
-	var response struct {
-		ResCode        int    `json:"res_code"`
-		ResMessage     string `json:"res_message"`
-		NeedAccessCode int    `json:"needAccessCode"`
-		ShareID        int64  `json:"shareId"`
+	bodyText := strings.TrimSpace(string(body))
+
+	var shareResponse struct {
+		XMLName        xml.Name `xml:"shareVO"`
+		NeedAccessCode int      `xml:"needAccessCode"`
+		ShareID        int64    `xml:"shareId"`
+		FileName       string   `xml:"fileName"`
+		AccessCode     string   `xml:"accessCode"`
 	}
-	_ = json.Unmarshal(body, &response)
+	if err := xml.Unmarshal(body, &shareResponse); err == nil && shareResponse.XMLName.Local == "shareVO" {
+		switch {
+		case shareResponse.ShareID > 0:
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		case shareResponse.FileName != "":
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		case shareResponse.NeedAccessCode == 1:
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		}
+	}
+
+	var errorResponse struct {
+		XMLName xml.Name `xml:"error"`
+		Code    string   `xml:"code"`
+		Message string   `xml:"message"`
+	}
+	if err := xml.Unmarshal(body, &errorResponse); err == nil && errorResponse.XMLName.Local == "error" {
+		message := coalesce(errorResponse.Message, errorResponse.Code)
+		messageLower := strings.ToLower(message)
+
+		switch {
+		case containsAny(messageLower, []string{"accesscode", "访问码", "提取码", "密码"}):
+			return s.buildResult(item, normalized, checkStateLocked, false, message), nil
+		case containsAny(messageLower, []string{"shareinfonotfound", "sharenotfound", "filenotfound", "shareexpirederror", "shareauditnotpass", "不存在", "失效", "取消", "过期"}):
+			return s.buildResult(item, normalized, checkStateBad, false, message), nil
+		}
+		return s.buildResult(item, normalized, checkStateBad, false, message), nil
+	}
 
 	switch {
-	case response.ShareID > 0:
-		return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
-	case response.NeedAccessCode == 1:
+	case statusCode == http.StatusOK && strings.Contains(bodyText, "<shareVO>"):
+		if strings.Contains(bodyText, "<shareId>") || strings.Contains(bodyText, "<fileName>") {
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		}
+		if strings.Contains(bodyText, "<needAccessCode>1</needAccessCode>") {
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		}
+		return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
+	case containsAny(strings.ToLower(bodyText), []string{"erroraccesscode", "needaccesscode", "访问码", "提取码", "密码"}):
 		return s.buildResult(item, normalized, checkStateLocked, false, "需要访问码"), nil
-	case response.ResMessage != "":
-		if containsAny(strings.ToLower(response.ResMessage), []string{"访问码", "提取码", "密码"}) {
-			return s.buildResult(item, normalized, checkStateLocked, false, response.ResMessage), nil
-		}
-		if containsAny(strings.ToLower(response.ResMessage), []string{"不存在", "失效", "取消", "过期"}) {
-			return s.buildResult(item, normalized, checkStateBad, false, response.ResMessage), nil
-		}
-		return s.buildResult(item, normalized, checkStateBad, false, response.ResMessage), nil
+	case containsAny(strings.ToLower(bodyText), []string{"shareinfonotfound", "sharenotfound", "filenotfound", "shareexpirederror", "shareauditnotpass", "不存在", "失效", "取消", "过期"}):
+		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	default:
 		return s.buildResult(item, normalized, checkStateUncertain, false, "无法确认链接状态"), nil
 	}
@@ -490,7 +553,7 @@ func (s *CheckService) check123(item model.CheckItem, normalized string) (model.
 		} `json:"data"`
 		Message string `json:"message"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil {
+	if err := utiljson.Unmarshal(body, &response); err != nil {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "响应解析失败"), nil
 	}
 
@@ -556,7 +619,7 @@ func (s *CheckService) checkXunlei(item model.CheckItem, normalized string) (mod
 		ShareStatus     string `json:"share_status"`
 		ShareStatusText string `json:"share_status_text"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil {
+	if err := utiljson.Unmarshal(body, &response); err != nil {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "响应解析失败"), nil
 	}
 
@@ -626,18 +689,26 @@ func (s *CheckService) check115(item model.CheckItem, normalized string) (model.
 		Error string `json:"error"`
 		Errno int    `json:"errno"`
 		Data  struct {
+			List       []any `json:"list"`
+			Count      int   `json:"count"`
 			ShareState int `json:"share_state"`
 			ShareInfo  struct {
+				SnapID       string `json:"snap_id"`
+				ShareTitle   string `json:"share_title"`
 				ShareState   int    `json:"share_state"`
 				ForbidReason string `json:"forbid_reason"`
 			} `json:"shareinfo"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil {
+	if err := utiljson.Unmarshal(body, &response); err != nil {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "响应解析失败"), nil
 	}
 
 	if response.State && response.Errno == 0 {
+		if len(response.Data.List) > 0 || response.Data.Count > 0 || response.Data.ShareInfo.SnapID != "" || response.Data.ShareInfo.ShareTitle != "" {
+			return s.buildResult(item, normalized, checkStateOK, false, "链接有效"), nil
+		}
+
 		shareState := response.Data.ShareState
 		if shareState == 0 {
 			shareState = response.Data.ShareInfo.ShareState
@@ -704,7 +775,7 @@ func (s *CheckService) checkMobile(item model.CheckItem, normalized string) (mod
 		return s.buildResult(item, normalized, checkStateUncertain, false, "请求加密失败"), err
 	}
 
-	requestBody, err := json.Marshal(encrypted)
+	requestBody, err := utiljson.Marshal(encrypted)
 	if err != nil {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "请求序列化失败"), err
 	}
@@ -725,7 +796,7 @@ func (s *CheckService) checkMobile(item model.CheckItem, normalized string) (mod
 	}
 
 	var response map[string]any
-	if err := json.Unmarshal([]byte(decrypted), &response); err != nil {
+	if err := utiljson.Unmarshal([]byte(decrypted), &response); err != nil {
 		return s.buildResult(item, normalized, checkStateUncertain, false, "响应解析失败"), nil
 	}
 
@@ -753,7 +824,7 @@ func (s *CheckService) checkMobile(item model.CheckItem, normalized string) (mod
 func (s *CheckService) doJSONRequest(ctx context.Context, method, targetURL string, payload any, headers map[string]string) ([]byte, int, error) {
 	var reader io.Reader
 	if payload != nil {
-		raw, err := json.Marshal(payload)
+		raw, err := utiljson.Marshal(payload)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -834,7 +905,7 @@ func (s *CheckService) fetchXunleiCaptchaToken(ctx context.Context) (string, err
 		CaptchaToken string `json:"captcha_token"`
 		URL          string `json:"url"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil {
+	if err := utiljson.Unmarshal(body, &response); err != nil {
 		return "", err
 	}
 	if response.URL != "" {
@@ -902,26 +973,7 @@ func ttlForState(state string) time.Duration {
 	}
 }
 
-func (s *CheckService) loadCacheFromDisk() {
-	raw, err := os.ReadFile(s.cacheFile)
-	if err != nil {
-		return
-	}
-
-	var data map[string]cachedCheckResult
-	if err := json.Unmarshal(raw, &data); err != nil {
-		return
-	}
-
-	now := time.Now()
-	for key, entry := range data {
-		if now.Before(entry.expiresAt) {
-			s.cache[key] = entry
-		}
-	}
-}
-
-func (s *CheckService) saveCacheToDiskLocked() {
+func (s *CheckService) openCacheStore() {
 	if s.cacheFile == "" {
 		return
 	}
@@ -930,12 +982,143 @@ func (s *CheckService) saveCacheToDiskLocked() {
 		return
 	}
 
-	raw, err := json.Marshal(s.cache)
+	db, err := bolt.Open(s.cacheFile, 0o600, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		return
 	}
 
-	_ = os.WriteFile(s.cacheFile, raw, 0o644)
+	if err := db.Update(func(tx *bolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte(checkCacheBucketName))
+		return err
+	}); err != nil {
+		_ = db.Close()
+		return
+	}
+
+	s.cacheDB = db
+}
+
+func encodeCachedCheckEntry(entry cachedCheckResult) ([]byte, error) {
+	payload := cachedCheckDiskEntry{
+		Result:    entry.result,
+		ExpiresAt: entry.expiresAt.UnixMilli(),
+	}
+
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(payload); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func decodeCachedCheckEntry(raw []byte) (cachedCheckResult, error) {
+	var payload cachedCheckDiskEntry
+	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&payload); err != nil {
+		return cachedCheckResult{}, err
+	}
+
+	return cachedCheckResult{
+		result:    payload.Result,
+		expiresAt: time.UnixMilli(payload.ExpiresAt),
+	}, nil
+}
+
+func (s *CheckService) loadPersistentCache(key string) (cachedCheckResult, bool) {
+	if s.cacheDB == nil {
+		return cachedCheckResult{}, false
+	}
+
+	var entry cachedCheckResult
+	var found bool
+	_ = s.cacheDB.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(checkCacheBucketName))
+		if bucket == nil {
+			return nil
+		}
+
+		raw := bucket.Get([]byte(key))
+		if len(raw) == 0 {
+			return nil
+		}
+
+		decoded, err := decodeCachedCheckEntry(raw)
+		if err != nil {
+			return nil
+		}
+
+		entry = decoded
+		found = true
+		return nil
+	})
+
+	return entry, found
+}
+
+func (s *CheckService) savePersistentCache(key string, entry cachedCheckResult) {
+	if s.cacheDB == nil {
+		return
+	}
+
+	raw, err := encodeCachedCheckEntry(entry)
+	if err != nil {
+		return
+	}
+
+	_ = s.cacheDB.Batch(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(checkCacheBucketName))
+		if bucket == nil {
+			return nil
+		}
+		return bucket.Put([]byte(key), raw)
+	})
+}
+
+func (s *CheckService) deletePersistentCache(key string) {
+	if s.cacheDB == nil {
+		return
+	}
+
+	_ = s.cacheDB.Batch(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(checkCacheBucketName))
+		if bucket == nil {
+			return nil
+		}
+		return bucket.Delete([]byte(key))
+	})
+}
+
+func (s *CheckService) pruneExpiredCacheStore() {
+	if s.cacheDB == nil {
+		return
+	}
+
+	now := time.Now()
+	_ = s.cacheDB.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte(checkCacheBucketName))
+		if bucket == nil {
+			return nil
+		}
+
+		var staleKeys [][]byte
+		_ = bucket.ForEach(func(key, value []byte) error {
+			entry, err := decodeCachedCheckEntry(value)
+			if err != nil || now.After(entry.expiresAt) {
+				keyCopy := make([]byte, len(key))
+				copy(keyCopy, key)
+				staleKeys = append(staleKeys, keyCopy)
+			}
+			return nil
+		})
+
+		for _, key := range staleKeys {
+			if err := bucket.Delete(key); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 func buildXunleiCaptchaSignature(clientID, clientVersion, packageName, deviceID string) (string, string) {
